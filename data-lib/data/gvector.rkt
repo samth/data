@@ -64,6 +64,18 @@
            #'(sleep 0.01)
            #'(void)))]))
 
+;; Like maybe-sleep but with a longer duration, for points where the
+;; concurrent operation itself contains a maybe-sleep.
+(define-syntax (maybe-sleep/long stx)
+  (syntax-case stx ()
+    [(_ tag)
+     (let ([env (getenv "GVECTOR_SLEEP")])
+       (if (and env
+                (or (equal? env "1")
+                    (equal? env (symbol->string (syntax-e #'tag)))))
+           #'(sleep 0.1)
+           #'(void)))]))
+
 (define DEFAULT-CAPACITY 10)
 
 (define MIN-CAPACITY 8)
@@ -208,6 +220,10 @@
 	(when (unsafe-struct*-cas! gv 0 v new-v)
 	  ;; Safety net: if a concurrent add pushed n past new-cap
 	  ;; between our re-read and the CAS, grow back immediately.
+	  ;; The trim-safety sleep is longer than other sleep points
+	  ;; so a concurrent add (which itself sleeps in ensure-space)
+	  ;; has time to complete and push n past new-cap.
+	  (maybe-sleep/long trim-safety)
 	  (when (> (gvector-n gv) new-cap)
 	    (ensure-free-space! gv 0)))))))
 
