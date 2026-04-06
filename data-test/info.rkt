@@ -12,6 +12,7 @@
                      ["data-lib" #:version "1.2.1"]
                      "rackunit-lib"
                      "rackcheck-lib"
+                     "errortrace-lib"
                      "math-lib"))
 (define update-implies '("data-lib"))
 

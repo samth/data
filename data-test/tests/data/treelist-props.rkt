@@ -7,7 +7,7 @@
 ;; properties (relating operations to each other without a model).
 ;;
 ;; Includes persistence properties verifying immutability and error path
-;; properties.
+;; properties.  Coverage-guided generation lives in "treelist-coverage.rkt".
 
 (require rackcheck
          rackunit
