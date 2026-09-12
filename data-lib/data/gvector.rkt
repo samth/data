@@ -49,6 +49,65 @@
          racket/vector
          racket/struct)
 
+(struct gvector (vec n)
+  #:mutable
+  ;; nothing subtypes a gvector, and the predicate runs on every
+  ;; operation; sealing turns its walk of the type's ancestry into one
+  ;; comparison.  Not `#:authentic`: `gvector-set!` handles an
+  ;; impersonated gvector, so they have to remain possible.
+  #:sealed
+  #:property prop:dict/contract
+             ;; These name the operations, which name the struct's accessors,
+             ;; so they have to be wrapped for the struct to be defined first --
+             ;; a property value is evaluated where it is written.
+             (list (vector-immutable (case-lambda
+                                       [(gv i) (gvector-ref gv i)]
+                                       [(gv i d) (gvector-ref gv i d)])
+                                     (lambda (gv i v) (gvector-set! gv i v))
+                                     #f ;; set
+                                     (lambda (gv i) (gvector-remove! gv i))
+                                     #f ;; remove
+                                     (lambda (gv) (gvector-count gv))
+                                     (lambda (gv) (gvector-iterate-first gv))
+                                     (lambda (gv it) (gvector-iterate-next gv it))
+                                     (lambda (gv it) (gvector-iterate-key gv it))
+                                     (lambda (gv it) (gvector-iterate-value gv it)))
+                   (vector-immutable exact-nonnegative-integer?
+                                     any/c
+                                     exact-nonnegative-integer?
+                                     #f #f #f))
+  #:methods gen:equal+hash
+  [(define (equal-proc x y recursive-equal?)
+     (let ([vx (gvector-vec x)]
+           [vy (gvector-vec y)]
+           [nx (gvector-n x)]
+           [ny (gvector-n y)])
+       (and (= nx ny)
+            (for/and ([index (in-range nx)])
+              (recursive-equal? (vector-ref vx index)
+                                (vector-ref vy index))))))
+   (define (hash-code x hc)
+     (let ([v (gvector-vec x)]
+           [n (gvector-n x)])
+       (for/fold ([h 1]) ([i (in-range n)])
+         ;; FIXME: better way of combining hashcodes
+         (+ h (hc (vector-ref v i))))))
+   (define hash-proc  hash-code)
+   (define hash2-proc hash-code)]
+  #:methods gen:custom-write
+  [(define write-proc
+     (make-constructor-style-printer
+      (lambda (obj) 'gvector)
+      (lambda (obj) (gvector->list obj))))]
+  #:property prop:sequence (lambda (gv) (in-gvector gv))
+  #:property prop:serializable
+  (make-serialize-info
+   (λ (this)
+     (vector (gvector->vector this)))
+   (cons 'deserialize-gvector (module-path-index-join '(submod data/gvector deserialize) #f))
+   #t
+   (or (current-load-relative-directory) (current-directory))))
+
 ;; When the environment variable GVECTOR_SLEEP is set at compile time,
 ;; (maybe-sleep tag) expands to (sleep 0.01), widening the race window
 ;; at the specified point so stress tests can exercise CAS retry paths.
@@ -113,7 +172,7 @@
   (define (grow-vec vec n needed-free-space)
     (define cap (unsafe-vector*-length vec))
     (define needed-cap (unsafe-fx+ n needed-free-space))
-    (cond [(<= needed-cap cap) #f]
+    (cond [(unsafe-fx<= needed-cap cap) #f]
 	  [else
 	   ;; taken from Rust's raw_vec implementation
 	   (let* ([new-cap (unsafe-fxmax (unsafe-fx* 2 cap) needed-cap)]
@@ -400,55 +459,6 @@
                                 [(one) (begin (unsafe-gvector-add! gv one) (values))]
                                 [args (begin (apply gvector-add! gv args) (values))])))
            gv)))]))
-
-(struct gvector (vec n)
-  #:mutable
-  #:property prop:dict/contract
-             (list (vector-immutable gvector-ref
-                                     gvector-set!
-                                     #f ;; set
-                                     gvector-remove!
-                                     #f ;; remove
-                                     gvector-count
-                                     gvector-iterate-first
-                                     gvector-iterate-next
-                                     gvector-iterate-key
-                                     gvector-iterate-value)
-                   (vector-immutable exact-nonnegative-integer?
-                                     any/c
-                                     exact-nonnegative-integer?
-                                     #f #f #f))
-  #:methods gen:equal+hash
-  [(define (equal-proc x y recursive-equal?)
-     (let ([vx (gvector-vec x)]
-           [vy (gvector-vec y)]
-           [nx (gvector-n x)]
-           [ny (gvector-n y)])
-       (and (= nx ny)
-            (for/and ([index (in-range nx)])
-              (recursive-equal? (vector-ref vx index)
-                                (vector-ref vy index))))))
-   (define (hash-code x hc)
-     (let ([v (gvector-vec x)]
-           [n (gvector-n x)])
-       (for/fold ([h 1]) ([i (in-range n)])
-         ;; FIXME: better way of combining hashcodes
-         (+ h (hc (vector-ref v i))))))
-   (define hash-proc  hash-code)
-   (define hash2-proc hash-code)]
-  #:methods gen:custom-write
-  [(define write-proc
-     (make-constructor-style-printer
-      (lambda (obj) 'gvector)
-      (lambda (obj) (gvector->list obj))))]
-  #:property prop:sequence in-gvector
-  #:property prop:serializable
-  (make-serialize-info
-   (λ (this)
-     (vector (gvector->vector this)))
-   (cons 'deserialize-gvector (module-path-index-join '(submod data/gvector deserialize) #f))
-   #t
-   (or (current-load-relative-directory) (current-directory))))
 
 (provide
  gvector?
