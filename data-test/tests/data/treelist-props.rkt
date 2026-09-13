@@ -6,8 +6,8 @@
 ;; (comparing treelist behavior to a reference list) and algebraic
 ;; properties (relating operations to each other without a model).
 ;;
-;; Includes persistence properties verifying immutability, error path
-;; properties, and a coverage-guided section.
+;; Includes persistence properties verifying immutability and error path
+;; properties.  Coverage-guided generation lives in "treelist-coverage.rkt".
 
 (require rackcheck
          rackunit
@@ -855,20 +855,6 @@
   (with-handlers ([exn:fail? (lambda (_) #t)])
     (treelist-rest empty-treelist)
     #f))
-
-;; =========================================================================
-;; Coverage-guided section
-;; =========================================================================
-
-(module+ guided
-  (require rackcheck rackunit racket/treelist racket/list)
-  (define treelist-src (collection-file-path "treelist.rkt" "racket"))
-  (check-guided-property prop:model-correspondence
-    #:config (make-guided-config #:max-iterations 5000
-                                 #:max-time-ms 120000
-                                 #:seed 42)
-    #:target treelist-src)
-  (printf "Guided property tests done.\n"))
 
 ;; =========================================================================
 ;; Test runner

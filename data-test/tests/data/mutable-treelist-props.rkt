@@ -1060,16 +1060,3 @@
 
   ;; Model-based with more iterations
   (check-property (make-config #:tests 200) prop:model-correspondence))
-
-;; ---------------------------------------------------------------------------
-;; Coverage-guided section
-
-(module+ guided
-  (require rackcheck rackunit racket/mutable-treelist racket/treelist racket/list)
-  (define mtl-src (collection-file-path "mutable-treelist.rkt" "racket"))
-  (check-guided-property prop:model-correspondence
-    #:config (make-guided-config #:max-iterations 5000
-                                 #:max-time-ms 120000
-                                 #:seed 42)
-    #:target mtl-src)
-  (printf "Guided property tests done.\n"))
