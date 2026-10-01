@@ -7,7 +7,9 @@
 (define pkg-desc "tests for \"data-lib\"")
 
 (define pkg-authors '(ryanc))
-(define build-deps '("data-enumerate-lib"
+(define build-deps '("errortrace-lib"
+                     "rackcheck-lib"
+                     "data-enumerate-lib"
                      "racket-index"
                      ["data-lib" #:version "1.2.1"]
                      "rackunit-lib"
