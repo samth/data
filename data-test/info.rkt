@@ -12,6 +12,8 @@
                      "racket-index"
                      ["data-lib" #:version "1.3"]
                      "rackunit-lib"
+                     "rackcheck-lib"
+                     "errortrace-lib"
                      "math-lib"))
 (define update-implies '("data-lib"))
 
