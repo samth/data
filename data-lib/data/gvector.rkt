@@ -116,6 +116,33 @@
    #t
    (or (current-load-relative-directory) (current-directory))))
 
+;; When the environment variable GVECTOR_SLEEP is set at compile time,
+;; (maybe-sleep tag) expands to (sleep 0.01), widening the race window
+;; at the specified point so stress tests can exercise CAS retry paths.
+;; GVECTOR_SLEEP=1 activates all sleep points; GVECTOR_SLEEP=tag
+;; activates only the matching point. When unset, expands to (void).
+(define-syntax (maybe-sleep stx)
+  (syntax-case stx ()
+    [(_ tag)
+     (let ([env (getenv "GVECTOR_SLEEP")])
+       (if (and env
+                (or (equal? env "1")
+                    (equal? env (symbol->string (syntax-e #'tag)))))
+           #'(sleep 0.01)
+           #'(void)))]))
+
+;; Like maybe-sleep but with a longer duration, for points where the
+;; concurrent operation itself contains a maybe-sleep.
+(define-syntax (maybe-sleep/long stx)
+  (syntax-case stx ()
+    [(_ tag)
+     (let ([env (getenv "GVECTOR_SLEEP")])
+       (if (and env
+                (or (equal? env "1")
+                    (equal? env (symbol->string (syntax-e #'tag)))))
+           #'(sleep 0.1)
+           #'(void)))]))
+
 (define DEFAULT-CAPACITY 10)
 
 (define MIN-CAPACITY 8)
@@ -177,6 +204,7 @@
   (define (ensure-free-space! gv needed-free-space)
     (let loop ()
       (define v (gvector-vec gv))
+      (maybe-sleep ensure-space) ; widen window for concurrent growers
       (define new-v (grow-vec v (gvector-n gv) needed-free-space))
       (when new-v
 	;; CAS: only install if vec hasn't been replaced by another thread.
@@ -192,6 +220,7 @@
     (begin (define n (gvector-n gv))
 	   (define v
 	     (let loop ([v1 (gvector-vec gv)])
+	       (maybe-sleep ensure-space) ; widen window for concurrent growers
 	       (define v2 (grow-vec v1 n needed-free-space))
 	       (cond [(not v2) v1]   ; already big enough
 		     ;; CAS: install new vec, retry if another thread changed it
@@ -249,6 +278,7 @@
   (let loop ()
     (define n0 (gvector-n gv))
     (define v (gvector-vec gv))
+    (maybe-sleep trim) ; widen window for concurrent add/trim
     (define cap (vector-length v))
     (define new-cap
       (let shrink ([new-cap cap])
@@ -266,6 +296,10 @@
 	(when (vec-cas! gv v new-v)
 	  ;; Safety net: if a concurrent add pushed n past new-cap
 	  ;; between our re-read and the CAS, grow back immediately.
+	  ;; The trim-safety sleep is longer than other sleep points
+	  ;; so a concurrent add (which itself sleeps in ensure-space)
+	  ;; has time to complete and push n past new-cap.
+	  (maybe-sleep/long trim-safety)
 	  (when (> (gvector-n gv) new-cap)
 	    (ensure-free-space! gv 0)))))))
 
@@ -302,6 +336,7 @@
     (raise-type-error 'gvector-ref "exact nonnegative integer" index))
   (let loop ()
     (define v (gvector-vec gv))
+    (maybe-sleep ref) ; widen window for concurrent add, remove or trim
     (define n (gvector-n gv))
     (cond
       [(< index n)
@@ -346,6 +381,7 @@
   (check-natural 'gvector-set! index)
   (let loop ()
     (define v (gvector-vec gv))
+    (maybe-sleep set) ; widen window for concurrent add, remove or trim
     (define n (gvector-n gv))
     (cond
       [(< index n)
@@ -415,6 +451,11 @@
   (define v (gvector-vec gv))
   (values v (unsafe-fxmin (gvector-n gv) (unsafe-vector*-length v))))
 
+;; The count, for in-gvector's loop, which reads it right after the vector.
+(define (gvector-count-after-vec gv)
+  (maybe-sleep iter) ; widen window for concurrent add, remove or trim
+  (gvector-n gv))
+
 (define-sequence-syntax in-gvector*
   (lambda () #'in-gvector)
   (lambda (stx)
@@ -428,12 +469,12 @@
             ;; (see gvector-ref), so the guard tests the index against both
             (:do-in ([(gv) gv-expr-c])
                     (void) ;; outer-check; handled by contract
-                    ([index 0] [vec (gvector-vec gv)] [n (gvector-n gv)]) ;; loop bindings
+                    ([index 0] [vec (gvector-vec gv)] [n (gvector-count-after-vec gv)]) ;; loop bindings
                     (and (unsafe-fx< index n) (unsafe-fx< index (unsafe-vector*-length vec))) ;; pos-guard
                     ([(var) (unsafe-vector*-ref vec index)]) ;; inner bindings
                     #t ;; pre-guard
                     #t ;; post-guard
-                    ((unsafe-fx+ 1 index) (gvector-vec gv) (gvector-n gv)))]))]
+                    ((unsafe-fx+ 1 index) (gvector-vec gv) (gvector-count-after-vec gv)))]))]
       [[(var ...) (in-gv gv-expr)]
        (with-syntax ([gv-expr-c (wrap-expr/c #'gvector? #'gv-expr #:macro #'in-gv)])
          (syntax/loc stx
