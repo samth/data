@@ -1,5 +1,29 @@
 #lang racket/base
 ;; written by ryanc
+
+;; The writers' ordering and CAS keep concurrent adds and removes from
+;; losing elements in most races:
+;;
+;; - Growing (gvector-add!, gvector-insert!, gvector-append!):
+;;   Update vec first (to a larger vector), then update n.
+;;
+;; - Shrinking (gvector-remove! + trim!):
+;;   Update n first (to a smaller value), then update vec.
+;;
+;; - CAS on vec (unsafe-struct*-cas! gv 0 old-vec new-vec):
+;;   When growing, define/ensure-space! uses CAS to install the new
+;;   vector. If another thread replaced vec concurrently (e.g. two
+;;   concurrent gvector-add! calls both creating new vectors), the
+;;   CAS fails and the operation retries with the current vec.
+;;   Without CAS, thread T1 could install a small vector while T2
+;;   installs a large n.
+;;   Similarly, trim! uses CAS when installing a smaller vector.
+;;
+;; - n re-read in trim!:
+;;   trim! re-reads n before creating the smaller vector. If n has
+;;   grown past the target capacity (from concurrent adds that didn't
+;;   need to resize vec), trim! aborts. After CAS succeeds, trim!
+;;   checks again and grows back via ensure-free-space! if needed.
 (require (for-syntax racket/base
                      syntax/contract
                      syntax/for-body)
@@ -114,15 +138,38 @@
 		  [new-cap (unsafe-fxmax new-cap MIN-CAPACITY)])
 	     (vector*-extend vec new-cap 0))]))
 
-  ;; define/ensure-space! : binds n and v after ensuring that v, the
-  ;; gvector's vec, has room for needed-free-space more elements past n.
+  ;; vec-cas! : GVector Vector Vector -> Boolean
+  ;; Installs new as gv's vec if gv's vec is still old.
+  (define (vec-cas! gv old new)
+    (unsafe-struct*-cas! gv 0 old new))
+
+  ;; ensure-free-space! : GVector Nat -> Void
+  ;; Ensures the gvector's vec has room for needed-free-space more
+  ;; elements beyond the current n. Uses CAS to install the new vector
+  ;; so that concurrent growers don't clobber each other.
+  (define (ensure-free-space! gv needed-free-space)
+    (let loop ()
+      (define v (gvector-vec gv))
+      (define new-v (grow-vec v (gvector-n gv) needed-free-space))
+      (when new-v
+	;; CAS: only install if vec hasn't been replaced by another thread.
+	;; If CAS fails, another thread installed a different vec; retry
+	;; to check if the new vec is big enough.
+	(unless (vec-cas! gv v new-v)
+	  (loop)))))
+
+  ;; define/ensure-space! : binds n and v after ensuring the gvector
+  ;; has room. Uses CAS on vec so concurrent ensure-space! calls
+  ;; don't clobber each other.
   (define-syntax-rule (define/ensure-space! (n v) gv needed-free-space)
     (begin (define n (gvector-n gv))
 	   (define v
-	     (let* ([v1 (gvector-vec gv)]
-		    [v2 (grow-vec v1 n needed-free-space)])
+	     (let loop ([v1 (gvector-vec gv)])
+	       (define v2 (grow-vec v1 n needed-free-space))
 	       (cond [(not v2) v1]   ; already big enough
-		     [else (set-gvector-vec! gv v2) v2])))))
+		     ;; CAS: install new vec, retry if another thread changed it
+		     [(vec-cas! gv v1 v2) v2]
+		     [else (loop (gvector-vec gv))])))))
 
   (define gvector-add!
     (case-lambda
@@ -160,19 +207,33 @@
 (define SHRINK-BY-FACTOR 2)
 
 (define (trim! gv)
-  (define n (gvector-n gv))
-  (define v (gvector-vec gv))
-  (define cap (vector-length v))
-  (define new-cap
-    (let loop ([new-cap cap])
-      (cond [(and (>= new-cap (* SHRINK-ON-FACTOR n))
-                  (>= (quotient new-cap SHRINK-BY-FACTOR) SHRINK-MIN))
-             (loop (quotient new-cap SHRINK-BY-FACTOR))]
-            [else new-cap])))
-  (when (< new-cap cap)
-    (define new-v (make-vector new-cap #f))
-    (vector-copy! new-v 0 v 0 n)
-    (set-gvector-vec! gv new-v)))
+  ;; n has already been decremented before calling trim!, so a smaller
+  ;; vec still holds every element, provided n hasn't grown since we
+  ;; read it. We re-read n before creating the new vec to abort if
+  ;; concurrent adds have grown n past our target capacity. After CAS,
+  ;; we check again and grow back if a concurrent add slipped through.
+  (let loop ()
+    (define n0 (gvector-n gv))
+    (define v (gvector-vec gv))
+    (define cap (vector-length v))
+    (define new-cap
+      (let shrink ([new-cap cap])
+	(cond [(and (>= new-cap (* SHRINK-ON-FACTOR n0))
+		    (>= (quotient new-cap SHRINK-BY-FACTOR) SHRINK-MIN))
+	       (shrink (quotient new-cap SHRINK-BY-FACTOR))]
+	      [else new-cap])))
+    (when (< new-cap cap)
+      ;; Re-read n: if concurrent adds grew n past new-cap, abort.
+      (define n (gvector-n gv))
+      (when (<= n new-cap)
+	(define new-v (make-vector new-cap #f))
+	(vector-copy! new-v 0 v 0 n)
+	;; CAS: only install smaller vec if no other thread replaced vec
+	(when (vec-cas! gv v new-v)
+	  ;; Safety net: if a concurrent add pushed n past new-cap
+	  ;; between our re-read and the CAS, grow back immediately.
+	  (when (> (gvector-n gv) new-cap)
+	    (ensure-free-space! gv 0)))))))
 
 ;; SLOW!
 (define (gvector-remove! gv index)
