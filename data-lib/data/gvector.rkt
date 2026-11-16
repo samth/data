@@ -1,6 +1,33 @@
 #lang racket/base
 ;; written by ryanc
 
+;; Memory safety under concurrent access:
+;;
+;; This data structure is NOT thread-safe: concurrent mutation may
+;; lose updates or produce incorrect results. It must never corrupt
+;; memory, however, and it uses unchecked vector operations, so each
+;; of them has to be safe whatever other threads do.
+;;
+;; No reader can rely on (<= (gvector-n gv) (vector-length (gvector-vec gv)))
+;; for the two values it reads, even though writers keep it when they
+;; can. Another thread may change either field between the two reads:
+;; a grower installs a larger vec and then a larger n, so a reader that
+;; reads vec first can see the old vec with the new n, and a shrinker
+;; stores n and then vec, so a reader that reads n first can see the old
+;; n with the new vec. No one order of reads serves both. Nor do the
+;; writers' orders reach other threads intact: Racket does not promise
+;; that one thread sees another's stores in program order (see "Machine
+;; Memory Order" in the reference), and on ARM it may not.
+;;
+;; So every unchecked access tests its index against a vector it holds:
+;;
+;; - gvector-ref, gvector-set! and in-gvector read vec once and test the
+;;   index against that vector's length as well as against n.
+;; - gvector-add! writes at the n it read, into the vector that
+;;   define/ensure-space! checked has room past that n.
+;; - Indexes from callers are checked to be natural numbers before any
+;;   unchecked operation sees them.
+;;
 ;; The writers' ordering and CAS keep concurrent adds and removes from
 ;; losing elements in most races:
 ;;
@@ -119,7 +146,7 @@
     (unless (gvector? gv)
       (raise-argument-error* who 'data/gvector "gvector?" gv)))
 
-  ;; for an index argument
+  ;; for an index argument, which unchecked operations may later use
   (define (check-natural who index)
     (unless (exact-nonnegative-integer? index)
       (raise-argument-error* who 'data/gvector "exact-nonnegative-integer?" index)))
@@ -174,22 +201,23 @@
   ;; gvector-add! of one item, without checking that gv is a gvector
   (define (unsafe-gvector-add! gv item)
     (define/ensure-space! (n v) gv 1)
-    (vector-set! v n item)
-    (set-gvector-n! gv (add1 n)))
+    ;; define/ensure-space! returned a v with room past the n it read
+    (unsafe-vector*-set! v n item)
+    (set-gvector-n! gv (unsafe-fx+ 1 n)))
 
   (define gvector-add!
     (case-lambda
       [(gv item)
        (check-gvector 'gvector-add! gv)
        (define/ensure-space! (n v) gv 1)
-       (vector-set! v n item)
-       (set-gvector-n! gv (add1 n))]
+       (unsafe-vector*-set! v n item)
+       (set-gvector-n! gv (unsafe-fx+ 1 n))]
       [(gv . items)
        (check-gvector 'gvector-add! gv)
        (define item-count (length items))
        (define/ensure-space! (n v) gv item-count)
        (for ([index (in-naturals n)] [item (in-list items)])
-	 (vector-set! v index item))
+	 (unsafe-vector*-set! v index item))
        (set-gvector-n! gv (+ n item-count))])))
 
 ;; SLOW!
@@ -271,8 +299,7 @@
   (check-gvector 'gvector-append! gv*)
   ;; gv* may be gv itself, whose vector the space check below may replace;
   ;; the vector read here still holds the same elements
-  (define v* (gvector-vec gv*))
-  (define n* (gvector-n gv*))
+  (define-values (v* n*) (gvector-vec+count gv*))
   (define/ensure-space! (n v) gv n*)
   (vector-copy! v n v* 0 n*)
   (set-gvector-n! gv (+ n n*)))
@@ -280,13 +307,12 @@
 (define (gvector-append gv gv*)
   (check-gvector 'gvector-append gv)
   (check-gvector 'gvector-append gv*)
-  (define n (gvector-n gv))
-  (define v* (gvector-vec gv*))
-  (define n* (gvector-n gv*))
+  (define-values (v n) (gvector-vec+count gv))
+  (define-values (v* n*) (gvector-vec+count gv*))
   ;; retain the spare capacity of gv*
   (define gv0 (make-gvector #:capacity (+ n (vector-length v*))))
   (define v0 (gvector-vec gv0))
-  (vector-copy! v0 0 (gvector-vec gv) 0 n)
+  (vector-copy! v0 0 v 0 n)
   (vector-copy! v0 n v* 0 n*)
   (set-gvector-n! gv0 (+ n n*))
   gv0)
@@ -297,27 +323,44 @@
   (check-gvector 'gvector-ref gv)
   (unless (exact-nonnegative-integer? index)
     (raise-type-error 'gvector-ref "exact nonnegative integer" index))
-  (if (< index (gvector-n gv))
-      (vector-ref (gvector-vec gv) index)
-      (cond [(eq? default none)
-             (check-index 'gvector-ref gv index #f)]
-            [(procedure? default) (default)]
-            [else default])))
+  (let loop ()
+    (define v (gvector-vec gv))
+    (define n (gvector-n gv))
+    (cond
+      [(< index n)
+       ;; n does not bound v: a concurrent add may have grown the gvector
+       ;; between the two reads, and then v is the old, shorter vector.
+       ;; Read again rather than past its end.
+       (if (unsafe-fx< index (unsafe-vector*-length v))
+           (unsafe-vector*-ref v index)
+           (loop))]
+      [(eq? default none)
+       (raise-range-error 'gvector-ref "gvector" "" index gv 0 (sub1 n))]
+      [(procedure? default) (default)]
+      [else default])))
 
 ;; gvector-set! with index = |gv| is interpreted as gvector-add!
 (define (gvector-set! gv index item)
   (check-gvector 'gvector-set! gv)
   (check-natural 'gvector-set! index)
-  (let ([n (gvector-n gv)])
-    (check-index 'gvector-set! gv index #t)
-    (if (= index n)
-        (gvector-add! gv item)
-        (vector-set! (gvector-vec gv) index item))))
+  (let loop ()
+    (define v (gvector-vec gv))
+    (define n (gvector-n gv))
+    (cond
+      [(< index n)
+       ;; as in gvector-ref, n does not bound v; write into the vector
+       ;; that holds index, never past the end of an old one
+       (if (unsafe-fx< index (unsafe-vector*-length v))
+           (unsafe-vector*-set! v index item)
+           (loop))]
+      [(= index n) (unsafe-gvector-add! gv item)]
+      [else (raise-range-error 'gvector-set! "gvector" "" index gv 0 n)])))
 
 ;; creates a snapshot vector
 (define (gvector->vector gv)
   (check-gvector 'gvector->vector gv)
-  (vector-copy (gvector-vec gv) 0 (gvector-n gv)))
+  (define-values (v n) (gvector-vec+count gv))
+  (vector*-copy v 0 n))
 
 (define (gvector->list gv)
   (check-gvector 'gvector->list gv)
@@ -349,8 +392,8 @@
 (define (gvector-iterate-next gv iter)
   (check-index 'gvector-iterate-next gv iter #f)
   (let ([n (gvector-n gv)])
-    (and (< (add1 iter) n)
-         (add1 iter))))
+    (and (< (unsafe-fx+ 1 iter) n)
+         (unsafe-fx+ 1 iter))))
 
 (define (gvector-iterate-key gv iter)
   (check-index 'gvector-iterate-key gv iter #f)
@@ -364,6 +407,13 @@
   (check-gvector 'in-gvector gv)
   (in-dict-values gv))
 
+;; The vector and the number of elements in it: at most n, and never more
+;; than the vector holds, since n does not bound a vector read before it
+;; (see gvector-ref).
+(define (gvector-vec+count gv)
+  (define v (gvector-vec gv))
+  (values v (unsafe-fxmin (gvector-n gv) (unsafe-vector*-length v))))
+
 (define-sequence-syntax in-gvector*
   (lambda () #'in-gvector)
   (lambda (stx)
@@ -372,14 +422,17 @@
        (with-syntax ([gv-expr-c (wrap-expr/c #'gvector? #'gv-expr #:macro #'in-gv)])
          (syntax/loc stx
            [(var)
+            ;; vec and n are read again at every step, so that the loop sees
+            ;; changes the body makes, as documented; n does not bound vec
+            ;; (see gvector-ref), so the guard tests the index against both
             (:do-in ([(gv) gv-expr-c])
                     (void) ;; outer-check; handled by contract
                     ([index 0] [vec (gvector-vec gv)] [n (gvector-n gv)]) ;; loop bindings
-                    (< index n) ;; pos-guard
-                    ([(var) (vector-ref vec index)]) ;; inner bindings
+                    (and (unsafe-fx< index n) (unsafe-fx< index (unsafe-vector*-length vec))) ;; pos-guard
+                    ([(var) (unsafe-vector*-ref vec index)]) ;; inner bindings
                     #t ;; pre-guard
                     #t ;; post-guard
-                    ((add1 index) (gvector-vec gv) (gvector-n gv)))]))]
+                    ((unsafe-fx+ 1 index) (gvector-vec gv) (gvector-n gv)))]))]
       [[(var ...) (in-gv gv-expr)]
        (with-syntax ([gv-expr-c (wrap-expr/c #'gvector? #'gv-expr #:macro #'in-gv)])
          (syntax/loc stx

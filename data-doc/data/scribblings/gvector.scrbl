@@ -27,7 +27,9 @@ number of elements in the gvector.
 Two gvectors are @racket[equal?] if they contain the same number of
 elements and if they contain equal elements at each index.
 
-Operations on gvectors are not thread-safe.
+Operations on gvectors are not thread-safe: threads that use one
+gvector at once, without synchronization, can lose updates or see wrong
+results. They do not corrupt memory, however.
 
 Additionally, gvectors are serializable with the
 @racketmodname[racket/serialize] collection.
